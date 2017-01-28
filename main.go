@@ -1,6 +1,3 @@
-//TODO: write file extention based on the Content-Type header
-//TODO: Test resume download
-//TODO: Add progress bar(s) for download progress
 //TODO: Allow for download from multiple sources. File will be downloaded in parts and then concatenated
 //TODO: bittorrent protocol? Probably want a library for this
 
@@ -126,7 +123,6 @@ func downloadFile(url, filePath string) error {
 	bar.ShowSpeed = true
 
 	bar.Set(int(offset))
-
 	r := bar.NewProxyReader(resp.Body)
 	io.Copy(f, r)
 
