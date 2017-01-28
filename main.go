@@ -14,6 +14,15 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
+
+	"time"
+
+	"io/ioutil"
+
+	"strings"
+
+	"github.com/cheggaaa/pb"
 )
 
 var url *string
@@ -52,7 +61,7 @@ func main() {
 
 	err = downloadFile(*url, *filePath)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(err)
 	}
 }
 
@@ -68,34 +77,37 @@ func downloadFile(url, filePath string) error {
 
 	//No resume
 	if *resume == false {
-		fmt.Println("Downloading file...")
 		resp, err = client.Do(req)
 		if err != nil {
 			return DLError.New("GET Request Error", err)
 		}
 
 		if filePath == "" {
-			fmt.Println(resp.Header)
 			cd := resp.Header.Get("Content-Disposition")
 			if cd == "" {
-				filePath = "file.png"
+				filePath = "file"
 			} else {
-				filePath = cd
+				filePath = strings.Split(cd, "/")[1]
 			}
 		}
 	}
 
 	//Open or Create file
 	f, offset, err := OpenFile(filePath)
+	defer f.Close()
 
 	//With Resume
 	if offset > 0 && *resume == true {
 		fmt.Println("Resuming download...")
 		//Do the request again with a Content-Range so as not to download everything again
-		req.Header.Add("Content-Range", fmt.Sprintf("%d", offset))
+		req.Header.Add("Range", fmt.Sprintf("bytes=%d-", offset))
 		resp, err = client.Do(req)
 		if err != nil {
 			return DLError.New("GET Request Error", err)
+		}
+
+		if len(resp.Header.Get("Content-Range")) == 0 {
+			io.CopyN(ioutil.Discard, resp.Body, offset)
 		}
 	}
 
@@ -103,18 +115,30 @@ func downloadFile(url, filePath string) error {
 		return DLError.New("resp is not set...", errors.New("No response set"))
 	}
 
-	fmt.Println("writing file named:", filePath)
-	io.Copy(f, resp.Body)
-	if err != nil {
-		return err
-	}
+	len, _ := strconv.Atoi(resp.Header.Get("Content-Length"))
+
+	bar := pb.New(len).SetUnits(pb.U_BYTES)
+	bar.Start()
+	bar.SetRefreshRate(time.Millisecond * 100)
+	bar.ShowPercent = false
+
+	bar.ShowTimeLeft = true
+	bar.ShowSpeed = true
+
+	bar.Set(int(offset))
+
+	r := bar.NewProxyReader(resp.Body)
+	io.Copy(f, r)
+
+	bar.Finish()
 
 	return nil
 }
 
 //OpenFile will open an existing file and seek to the end
 func OpenFile(filePath string) (*os.File, int64, error) {
-	f, err := os.Open(filePath)
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0666)
+	offset := int64(0)
 	if err != nil {
 		f, err = os.Create(filePath)
 		if err != nil {
@@ -124,10 +148,9 @@ func OpenFile(filePath string) (*os.File, int64, error) {
 	}
 
 	fi, err := f.Stat()
-
-	_, err = f.Seek(fi.Size(), 2)
 	if err != nil {
-		return nil, fi.Size(), DLError.New("File seek error", err)
+		return nil, 0, DLError.New("Getting file stat error", err)
 	}
-	return f, fi.Size(), nil
+	offset = fi.Size()
+	return f, offset, nil
 }
