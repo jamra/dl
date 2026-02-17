@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 
@@ -22,89 +23,138 @@ import (
 	"github.com/cheggaaa/pb"
 )
 
-var url *string
-var filePath *string
-var resume *bool
+// Config holds the configuration for a download
+type Config struct {
+	URL      string
+	FilePath string
+	Resume   bool
+	Timeout  time.Duration
+}
 
 var usage = `
         dl downloads files over http and allows for resume features.
         usage dl -url "http://url" [[-r] -o file.out]]
 `
 
-func parseFlags() error {
-	url = flag.String("url", "", "the url to download")
-	filePath = flag.String("o", "", "the output file path")
-	resume = flag.Bool("r", false, "-r")
+func parseFlags() (*Config, error) {
+	urlFlag := flag.String("url", "", "the url to download")
+	filePath := flag.String("o", "", "the output file path")
+	resume := flag.Bool("r", false, "-r")
+	timeout := flag.Int("timeout", 30, "request timeout in seconds")
 
 	flag.Parse()
 
-	if *url == "" {
-		return errors.New("URL is not set")
+	if *urlFlag == "" {
+		return nil, errors.New("URL is not set")
 	}
 	if *resume && *filePath == "" {
-		return errors.New("-o must be set if you are resuming")
+		return nil, errors.New("-o must be set if you are resuming")
 	}
 
-	return nil
+	// Validate URL
+	_, err := url.ParseRequestURI(*urlFlag)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	return &Config{
+		URL:      *urlFlag,
+		FilePath: *filePath,
+		Resume:   *resume,
+		Timeout:  time.Duration(*timeout) * time.Second,
+	}, nil
 }
 
 func main() {
-	err := parseFlags()
+	config, err := parseFlags()
 	if err != nil {
 		fmt.Println(err)
 		fmt.Println(usage)
 		return
 	}
 
-	err = downloadFile(*url, *filePath)
+	err = downloadFile(config)
 	if err != nil {
 		fmt.Println(err)
 	}
 }
 
-func downloadFile(url, filePath string) error {
-	client := &http.Client{}
+func downloadFile(config *Config) error {
+	client := &http.Client{
+		Timeout: config.Timeout,
+	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", config.URL, nil)
 	if err != nil {
 		return DLError.New("Creating request error", err)
 	}
 
 	var resp *http.Response
+	filePath := config.FilePath
 
 	//No resume
-	if *resume == false {
+	if !config.Resume {
 		resp, err = client.Do(req)
 		if err != nil {
 			return DLError.New("GET Request Error", err)
 		}
+		defer resp.Body.Close()
+
+		// Validate HTTP status code
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("HTTP error: %s (status code %d)", resp.Status, resp.StatusCode)
+		}
 
 		if filePath == "" {
-			cd := resp.Header.Get("Content-Disposition")
-			if cd == "" {
-				filePath = "file"
-			} else {
-				filePath = strings.Split(cd, "/")[1]
-			}
+			filePath = extractFilename(resp, config.URL)
 		}
 	}
 
 	//Open or Create file
 	f, offset, err := OpenFile(filePath)
+	if err != nil {
+		return err
+	}
 	defer f.Close()
 
 	//With Resume
-	if offset > 0 && *resume == true {
+	if offset > 0 && config.Resume {
 		fmt.Println("Resuming download...")
-		//Do the request again with a Content-Range so as not to download everything again
+		//Do the request again with a Range header so as not to download everything again
 		req.Header.Add("Range", fmt.Sprintf("bytes=%d-", offset))
 		resp, err = client.Do(req)
 		if err != nil {
 			return DLError.New("GET Request Error", err)
 		}
+		defer resp.Body.Close()
 
+		// Check if server supports Range requests
+		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			return fmt.Errorf("resume failed: file already complete or server range error")
+		}
+
+		if resp.StatusCode != http.StatusPartialContent {
+			if resp.StatusCode == http.StatusOK {
+				// Server doesn't support Range - need to start over
+				fmt.Println("Warning: Server doesn't support resume. Starting download from beginning...")
+				f.Close()
+				os.Remove(filePath)
+				// Recursively call with Resume disabled
+				newConfig := *config
+				newConfig.Resume = false
+				return downloadFile(&newConfig)
+			}
+			return fmt.Errorf("HTTP error: %s (status code %d)", resp.Status, resp.StatusCode)
+		}
+
+		// Verify server actually supports Range
 		if len(resp.Header.Get("Content-Range")) == 0 {
-			io.CopyN(ioutil.Discard, resp.Body, offset)
+			fmt.Println("Warning: Server doesn't support Range header properly. Starting from beginning...")
+			f.Close()
+			os.Remove(filePath)
+			newConfig := *config
+			newConfig.Resume = false
+			return downloadFile(&newConfig)
 		}
 	}
 
@@ -112,9 +162,12 @@ func downloadFile(url, filePath string) error {
 		return DLError.New("resp is not set...", errors.New("No response set"))
 	}
 
-	len, _ := strconv.Atoi(resp.Header.Get("Content-Length"))
+	contentLength, _ := strconv.Atoi(resp.Header.Get("Content-Length"))
+	totalSize := contentLength + int(offset)
 
-	bar := pb.New(len).SetUnits(pb.U_BYTES)
+	fmt.Printf("Downloading to: %s\n", filePath)
+
+	bar := pb.New(totalSize).SetUnits(pb.U_BYTES)
 	bar.Start()
 	bar.SetRefreshRate(time.Millisecond * 100)
 	bar.ShowPercent = false
@@ -129,6 +182,38 @@ func downloadFile(url, filePath string) error {
 	bar.Finish()
 
 	return nil
+}
+
+// extractFilename extracts filename from Content-Disposition header or URL
+func extractFilename(resp *http.Response, downloadURL string) string {
+	// Try Content-Disposition header first
+	cd := resp.Header.Get("Content-Disposition")
+	if cd != "" {
+		// Look for filename= or filename*= parameter
+		if strings.Contains(cd, "filename=") {
+			parts := strings.Split(cd, "filename=")
+			if len(parts) > 1 {
+				filename := strings.Trim(parts[1], `"`)
+				filename = strings.Split(filename, ";")[0]
+				if filename != "" {
+					return strings.TrimSpace(filename)
+				}
+			}
+		}
+	}
+
+	// Fallback to URL path
+	parsedURL, err := url.Parse(downloadURL)
+	if err == nil && parsedURL.Path != "" {
+		parts := strings.Split(parsedURL.Path, "/")
+		filename := parts[len(parts)-1]
+		if filename != "" {
+			return filename
+		}
+	}
+
+	// Last resort
+	return "downloaded_file"
 }
 
 //OpenFile will open an existing file and seek to the end
