@@ -5,9 +5,14 @@ package main
 
 import (
 	"DLError"
+	"crypto/md5"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -25,15 +30,37 @@ import (
 
 // Config holds the configuration for a download
 type Config struct {
-	URL      string
-	FilePath string
-	Resume   bool
-	Timeout  time.Duration
+	URL         string
+	FilePath    string
+	Resume      bool
+	Timeout     time.Duration
+	Checksum    string
+	ChecksumAlg string // "md5", "sha256", "sha512"
+	MaxRetries  int
+	Quiet       bool
 }
 
 var usage = `
-        dl downloads files over http and allows for resume features.
-        usage dl -url "http://url" [[-r] -o file.out]]
+dl - HTTP file downloader with resume capability
+
+Usage: dl -url "http://url" [options]
+
+Options:
+  -url string        URL to download (required)
+  -o string          Output file path (auto-detected if not specified)
+  -r                 Resume incomplete download (requires -o)
+  -timeout int       Request timeout in seconds (default: 30)
+  -retry int         Maximum retry attempts (default: 3)
+  -q                 Quiet mode - no progress bar
+  -md5 string        Expected MD5 checksum for verification
+  -sha256 string     Expected SHA256 checksum for verification
+  -sha512 string     Expected SHA512 checksum for verification
+
+Examples:
+  dl -url "http://example.com/file.zip"
+  dl -url "http://example.com/file.zip" -o output.zip -sha256 "abc123..."
+  dl -url "http://example.com/file.zip" -o output.zip -r
+  dl -url "http://example.com/file.zip" -retry 5 -timeout 60
 `
 
 func parseFlags() (*Config, error) {
@@ -41,6 +68,11 @@ func parseFlags() (*Config, error) {
 	filePath := flag.String("o", "", "the output file path")
 	resume := flag.Bool("r", false, "-r")
 	timeout := flag.Int("timeout", 30, "request timeout in seconds")
+	md5sum := flag.String("md5", "", "expected MD5 checksum")
+	sha256sum := flag.String("sha256", "", "expected SHA256 checksum")
+	sha512sum := flag.String("sha512", "", "expected SHA512 checksum")
+	maxRetries := flag.Int("retry", 3, "maximum number of retry attempts")
+	quiet := flag.Bool("q", false, "quiet mode (no progress bar)")
 
 	flag.Parse()
 
@@ -57,11 +89,29 @@ func parseFlags() (*Config, error) {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
 
+	// Determine checksum algorithm
+	checksum := ""
+	checksumAlg := ""
+	if *sha256sum != "" {
+		checksum = *sha256sum
+		checksumAlg = "sha256"
+	} else if *sha512sum != "" {
+		checksum = *sha512sum
+		checksumAlg = "sha512"
+	} else if *md5sum != "" {
+		checksum = *md5sum
+		checksumAlg = "md5"
+	}
+
 	return &Config{
-		URL:      *urlFlag,
-		FilePath: *filePath,
-		Resume:   *resume,
-		Timeout:  time.Duration(*timeout) * time.Second,
+		URL:         *urlFlag,
+		FilePath:    *filePath,
+		Resume:      *resume,
+		Timeout:     time.Duration(*timeout) * time.Second,
+		Checksum:    checksum,
+		ChecksumAlg: checksumAlg,
+		MaxRetries:  *maxRetries,
+		Quiet:       *quiet,
 	}, nil
 }
 
@@ -73,10 +123,64 @@ func main() {
 		return
 	}
 
-	err = downloadFile(config)
+	err = downloadWithRetry(config)
 	if err != nil {
 		fmt.Println(err)
+		os.Exit(1)
 	}
+}
+
+// downloadWithRetry implements retry logic with exponential backoff
+func downloadWithRetry(config *Config) error {
+	var lastErr error
+	
+	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 2^attempt seconds
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			if !config.Quiet {
+				fmt.Printf("Retry attempt %d/%d after %v...\n", attempt, config.MaxRetries, backoff)
+			}
+			time.Sleep(backoff)
+		}
+		
+		err := downloadFile(config)
+		if err == nil {
+			// Download successful, verify checksum if provided
+			if config.Checksum != "" {
+				if !config.Quiet {
+					fmt.Printf("Verifying %s checksum...\n", config.ChecksumAlg)
+				}
+				err = verifyChecksum(config.FilePath, config.Checksum, config.ChecksumAlg)
+				if err != nil {
+					return fmt.Errorf("checksum verification failed: %w", err)
+				}
+				if !config.Quiet {
+					fmt.Println("✓ Checksum verified successfully")
+				}
+			}
+			return nil
+		}
+		
+		lastErr = err
+		
+		// Don't retry on certain errors
+		if isNonRetryableError(err) {
+			return err
+		}
+	}
+	
+	return fmt.Errorf("download failed after %d attempts: %w", config.MaxRetries+1, lastErr)
+}
+
+// isNonRetryableError determines if an error should not be retried
+func isNonRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Don't retry on client errors (4xx) except 408 (timeout)
+	return strings.Contains(errStr, "status code 4") && !strings.Contains(errStr, "408")
 }
 
 func downloadFile(config *Config) error {
@@ -119,7 +223,9 @@ func downloadFile(config *Config) error {
 
 	//With Resume
 	if offset > 0 && config.Resume {
-		fmt.Println("Resuming download...")
+		if !config.Quiet {
+			fmt.Println("Resuming download...")
+		}
 		//Do the request again with a Range header so as not to download everything again
 		req.Header.Add("Range", fmt.Sprintf("bytes=%d-", offset))
 		resp, err = client.Do(req)
@@ -136,7 +242,9 @@ func downloadFile(config *Config) error {
 		if resp.StatusCode != http.StatusPartialContent {
 			if resp.StatusCode == http.StatusOK {
 				// Server doesn't support Range - need to start over
-				fmt.Println("Warning: Server doesn't support resume. Starting download from beginning...")
+				if !config.Quiet {
+					fmt.Println("Warning: Server doesn't support resume. Starting download from beginning...")
+				}
 				f.Close()
 				os.Remove(filePath)
 				// Recursively call with Resume disabled
@@ -149,7 +257,9 @@ func downloadFile(config *Config) error {
 
 		// Verify server actually supports Range
 		if len(resp.Header.Get("Content-Range")) == 0 {
-			fmt.Println("Warning: Server doesn't support Range header properly. Starting from beginning...")
+			if !config.Quiet {
+				fmt.Println("Warning: Server doesn't support Range header properly. Starting from beginning...")
+			}
 			f.Close()
 			os.Remove(filePath)
 			newConfig := *config
@@ -165,12 +275,21 @@ func downloadFile(config *Config) error {
 	contentLength, _ := strconv.Atoi(resp.Header.Get("Content-Length"))
 	totalSize := contentLength + int(offset)
 
-	fmt.Printf("Downloading to: %s\n", filePath)
+	if !config.Quiet {
+		fmt.Printf("Downloading to: %s\n", filePath)
+	}
 
+	if config.Quiet {
+		// Quiet mode: just copy without progress bar
+		_, err = io.Copy(f, resp.Body)
+		return err
+	}
+
+	// Show progress bar
 	bar := pb.New(totalSize).SetUnits(pb.U_BYTES)
 	bar.Start()
 	bar.SetRefreshRate(time.Millisecond * 100)
-	bar.ShowPercent = false
+	bar.ShowPercent = true
 
 	bar.ShowTimeLeft = true
 	bar.ShowSpeed = true
@@ -180,6 +299,40 @@ func downloadFile(config *Config) error {
 	io.Copy(f, r)
 
 	bar.Finish()
+
+	return nil
+}
+
+// verifyChecksum computes and verifies the file checksum
+func verifyChecksum(filePath, expectedChecksum, algorithm string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot open file for checksum: %w", err)
+	}
+	defer f.Close()
+
+	var h hash.Hash
+	switch algorithm {
+	case "md5":
+		h = md5.New()
+	case "sha256":
+		h = sha256.New()
+	case "sha512":
+		h = sha512.New()
+	default:
+		return fmt.Errorf("unsupported checksum algorithm: %s", algorithm)
+	}
+
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("error reading file for checksum: %w", err)
+	}
+
+	actualChecksum := hex.EncodeToString(h.Sum(nil))
+	expectedChecksum = strings.ToLower(strings.TrimSpace(expectedChecksum))
+
+	if actualChecksum != expectedChecksum {
+		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
+	}
 
 	return nil
 }
